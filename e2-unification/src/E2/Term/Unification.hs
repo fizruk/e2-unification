@@ -236,9 +236,9 @@ tryE2
   -> f ([Constraint m a], MetaSubsts m a)
 tryE2 _ [] = pure mempty
 tryE2 rules cs =
-  once (tryDeleteEliminate cs) `orElse`
-    tryRigidRigid cs `orElse`
-      tryFlex cs
+  once (tryDeleteEliminate cs) `orElse`   -- apply delete and eliminate rules first (deterministic)
+    tryRigidRigid cs `orElse`             -- then solve rigid-rigid constraints (non-deterministic)
+      tryFlex cs                          -- finally, solve flex-rigid and flex-flex constraints
   where
     tryDeleteEliminate cs = do
       (c, cs') <- selectOne cs
@@ -657,32 +657,6 @@ pair f s = Con "PAIR" [Regular f, Regular s]
 --     (Regular t, Regular t') -> match' t t'
 --     (Scoped s, Scoped s')   -> match' (joinInc <$> s) (joinInc <$> s')
 --     _                       -> Nothing
-
-joinInc :: Inc (IncMany a) -> IncMany a
-joinInc Z         = B 0
-joinInc (S (B i)) = B (i + 1)
-joinInc (S (F x)) = F x
-
-commuteInc :: Inc (IncMany a) -> IncMany (Inc a)
-commuteInc Z         = F Z
-commuteInc (S (B i)) = B i
-commuteInc (S (F x)) = F (S x)
-
-removeInc :: Alternative f => Inc a -> f a
-removeInc Z     = empty
-removeInc (S x) = pure x
-
-removeIncMany :: Alternative f => IncMany a -> f a
-removeIncMany (B _) = empty
-removeIncMany (F x) = pure x
-
-decIncMany :: Alternative f => IncMany a -> f (IncMany a)
-decIncMany (B 0) = empty
-decIncMany (B i) = pure (B (i - 1))
-decIncMany (F x) = pure (F x)
-
-removeAllIncMany :: (Traversable t, Alternative f) => t (IncMany a) -> f (t a)
-removeAllIncMany = traverse removeIncMany
 
 
 ex1 :: Term Variable Void
