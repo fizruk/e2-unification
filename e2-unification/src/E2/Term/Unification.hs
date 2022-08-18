@@ -1,36 +1,27 @@
 {-# LANGUAGE DeriveFoldable             #-}
 {-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE DeriveTraversable          #-}
-{-# LANGUAGE DerivingStrategies         #-}
-{-# LANGUAGE FlexibleContexts           #-}
-{-# LANGUAGE FlexibleInstances          #-}
-{-# LANGUAGE FunctionalDependencies     #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase                 #-}
-{-# LANGUAGE MultiParamTypeClasses      #-}
-{-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE QuantifiedConstraints      #-}
 {-# LANGUAGE RecordWildCards            #-}
-{-# LANGUAGE StandaloneDeriving         #-}
-{-# LANGUAGE UndecidableInstances       #-}
 module E2.Term.Unification where
 
--- import           Debug.Trace
+import           Data.Coerce          (coerce)
+import           Debug.Trace
 import           Unsafe.Coerce
 
 import           Control.Applicative
-import           Control.Arrow         ((&&&))
 import           Control.Monad
 import           Control.Monad.Logic
 import           Control.Monad.State
 import           Control.Monad.Writer
 import qualified Data.Bifunctor
-import           Data.Functor.Identity
-import           Data.List             (elemIndex, inits, intercalate, nub,
-                                        tails)
-import           Data.Semigroup
+import           Data.List            (elemIndex, inits, nub, tails)
 import           Data.Void
 
+import           Control.Monad.Fresh
+import           E2.Rule
 import           E2.Term
 
 -- | Quantify over arbitrarily many variables using 'Inc'.
@@ -59,19 +50,6 @@ instance Traversable t => Traversable (Forall t) where
   traverse f (Forall t) = Forall <$> traverse (traverse f) t
   traverse f (Ground t) = Ground <$> traverse f t
 
--- | A rule \(t \to u\).
-data Rule metavar a
-  = Term metavar a :-> Term metavar a
-  deriving (Eq, Show)
-
--- | Extract rule's left hand side.
-ruleLHS :: Rule m Void -> Term m Void
-ruleLHS (lhs :-> _rhs) = lhs
-
--- | Extract left hand side from a collection of rules.
-rulesLHS :: [Rule m Void] -> [Term m Void]
-rulesLHS = map ruleLHS
-
 -- | A ground constraint has no quantifiers.
 data GroundConstraint metavar var
   = Term metavar var :==: Term metavar var  -- ^ \( t \stackrel{?}{=} u\)
@@ -81,46 +59,6 @@ data GroundConstraint metavar var
 --
 -- \(\forall \overline{x_k}. t \stackrel{?}{=} u\)
 type Constraint metavar = Forall (GroundConstraint metavar)
-
--- | A meta variable substitution.
-data MetaSubst m var = MetaSubst
-  { metaSubstVar   :: m                     -- ^ Meta variable to be substituted.
-  , metaSubstArity :: Int                   -- ^ Meta variable arity (for checks).
-  , metaSubstBody  :: Term m (IncMany var)  -- ^ Meta variable body (a scoped term).
-  } deriving (Show, Functor, Foldable, Traversable)
-
--- | Construct a meta variable substitution and
--- check that its declared arity is not exceeded in the body.
-metaSubst :: m -> Int -> Term m (IncMany var) -> MetaSubst m var
-metaSubst m arity body
-  | actualArity >= Just (Max arity) = error "actual arity of the body exceeds declared arity of a meta variable"
-  | otherwise = MetaSubst m arity body
-  where
-    actualArity = foldMap bound body
-    bound (B i) = Just (Max i)
-    bound (F _) = Nothing
-
--- | A collection of simultaneous meta variable substitutions.
-newtype MetaSubsts m var = MetaSubsts
-  { getMetaSubsts :: [MetaSubst m var] }
-  deriving newtype (Show)
-  deriving stock (Functor, Foldable, Traversable)
-
--- | Convert meta substitutions into a lookup list.
-toLookupList :: MetaSubsts m var -> [(m, Term m (IncMany var))]
-toLookupList = map (metaSubstVar &&& metaSubstBody) . getMetaSubsts
-
--- | Composition of substitutions.
-instance Eq m => Semigroup (MetaSubsts m var) where
-  MetaSubsts xs <> MetaSubsts ys = MetaSubsts (xs <> map update ys)
-    where
-      update ms@MetaSubst{..} = ms
-        { metaSubstBody = substituteMeta' (`lookup` substs) metaSubstBody }
-
-      substs = fmap (fmap (fmap F)) <$> toLookupList (MetaSubsts xs)
-
-instance Eq m => Monoid (MetaSubsts m var) where
-  mempty = MetaSubsts []
 
 -- | Apply meta substitutions to a given constraint.
 applySubsts :: Eq m => MetaSubsts m a -> Constraint m a -> Constraint m a
@@ -142,7 +80,22 @@ newtype Unify v a = Unify { runUnify :: LogicT (Fresh v) a }
 --
 -- NOTE: will throw an exception when no solution is available.
 defaultUnify :: Unify Variable a -> a
-defaultUnify = head . flip evalFresh defaultVars . observeAllT . runUnify
+defaultUnify = head . flip evalFresh defaultVars . observeManyT 10 . runUnify
+  where
+    defaultVars = [ Variable ("m" ++ toSub n) | n <- [0..] ]
+    toSub = map toSubDigit . show
+    mappings = zip "0123456789" "₀₁₂₃₄₅₆₇₈₉"
+    toSubDigit d =
+      case lookup d mappings of
+        Nothing -> '.'
+        Just c  -> c
+
+-- | Run a unification computation using default fresh name supply
+-- and extracting all results.
+--
+-- NOTE: will throw an exception when no solution is available.
+defaultUnifyAll :: Unify Variable a -> [a]
+defaultUnifyAll = flip evalFresh defaultVars . observeAllT . runUnify
   where
     defaultVars = [ Variable ("m" ++ toSub n) | n <- [0..] ]
     toSub = map toSubDigit . show
@@ -172,13 +125,13 @@ tryE2 rules constraints =
   -- apply delete and eliminate rules first (deterministic)
   once (tryDeleteEliminate constraints) `orElse`
     -- then solve rigid-rigid constraints (non-deterministic)
-    tryRigidRigid constraints `orElse`
+    tryRigidRigid constraints <|> -- `orElse`
       -- finally, solve flex-rigid and flex-flex constraints
       tryFlex constraints
   where
     tryDeleteEliminate cs = do
       (c, cs') <- selectOne cs
-      (cs'', substs) <- upgrade (\c' _bvars -> delete c' <|> eliminate c') c
+      (cs'', substs) <- upgrade (\c' _bvars -> delete c') c -- <|> eliminate c') c
       return (cs'' <> map (applySubsts substs) cs', substs)
 
     tryRigidRigid cs = do
@@ -276,7 +229,10 @@ tryClose m =
   msplit m >>= \case
     Nothing      -> pure (Left [])
     Just ((cs, substs), xs)
-      | null cs   -> pure (Right substs)
+      | null cs   -> pure (Right substs) <|> tryClose xs  {- <|> do
+          (cs', substs') <- xs
+          guard (null cs')
+          return (Right substs') -}
       | otherwise -> Data.Bifunctor.first ((cs, substs) :) <$> tryClose xs
 
 -- | Extract all meta variables from a constraint.
@@ -306,27 +262,6 @@ ppConstraint freshVars ppVar = \case
       []   -> error "not enough fresh variables"
       x:xs -> "forall " <> x <> "." <> ppConstraint xs (ppInc x . fmap ppVar) c
   Ground (t :==: t') -> ppTerm freshVars ppVar t <> " =?= " <> ppTerm freshVars ppVar t'
-
-ppMetaSubsts' :: MetaSubsts Variable Variable -> String
-ppMetaSubsts' = ppMetaSubsts defaultFreshVars getVariable
-
-ppMetaSubsts :: [String] -> (a -> String) -> MetaSubsts Variable a -> String
-ppMetaSubsts freshVars ppVar (MetaSubsts substs) =
-  intercalate "\n" (map (ppMetaSubst freshVars ppVar) substs)
-
-ppMetaSubst :: [String] -> (a -> String) -> MetaSubst Variable a -> String
-ppMetaSubst freshVars ppVar (MetaSubst (Variable m) arity t)
-  = case splitAt arity freshVars of
-      (xs, ys)
-        | length xs < arity -> error "not enough fresh variables"
-        | otherwise ->
-            let params = intercalate ", " xs
-            in m <> "[" <> params <> "]" <> " -> " <> ppTerm ys (ppIncMany xs . fmap ppVar) t
-
-ppRules :: [Rule Variable Void] -> String
-ppRules = unlines . map ppRule
-  where
-    ppRule (t :-> t') = ppTerm defaultFreshVars absurd t <> " ——» " <> ppTerm defaultFreshVars absurd t'
 
 -- * \(E^2\)-unification rules
 
@@ -399,10 +334,10 @@ imitate = \case
       (args'', constraints) <- runWriterT $ traverse (argTermToMetaVar args) args'
       notrace ("[imitate (left)] " <> show con) $ return (constraints, MetaSubsts [metaSubst m (length args) (Con con args'')])
   -- imitate (right)
---   Con con args' :==: MetaVar m args
---     | m `notElem` (foldMap metavarsArg args') -> do
---       (args'', constraints) <- runWriterT $ traverse (argTermToMetaVar args) args'
---       notrace ("[imitate (right)] " <> show con) $ return (constraints, MetaSubsts [metaSubst m (length args) (Con con args'')])
+  Con con args' :==: MetaVar m args
+    | m `notElem` (foldMap metavarsArg args') -> do
+      (args'', constraints) <- runWriterT $ traverse (argTermToMetaVar args) args'
+      notrace ("[imitate (right)] " <> show con) $ return (constraints, MetaSubsts [metaSubst m (length args) (Con con args'')])
   _ -> empty
 
 -- | Project rule: \(\forall \overline{x_k}. m[\overline{t_k}] \stackrel{?}{=} u \longrightarrow \langle C, \sigma \rangle \) where
@@ -420,13 +355,14 @@ project = \case
     | m `notElem` metavars u -> do
       i <- choose [0 .. length args - 1]
       let constraint = Ground (args !! i :==: u)
-      notrace "[project (left)]" $ return ([constraint], MetaSubsts [metaSubst m (length args) (Var (B i))])
+      notrace ("[project " ++ show (i + 1) ++ "/" ++ show (length args) ++ " (left)]") $
+        return ([constraint], MetaSubsts [metaSubst m (length args) (Var (B i))])
   -- project (right)
---   MetaVar m args :==: u
---     | m `notElem` metavars u -> do
---       i <- choose [0 .. length args - 1]
---       let constraint = Ground (args !! i :==: u)
---       notrace "[project (right)]" $ return ([constraint], MetaSubsts [metaSubst m (length args) (Var (B i))])
+  MetaVar m args :==: u
+    | m `notElem` metavars u -> do
+      i <- choose [0 .. length args - 1]
+      let constraint = Ground (args !! i :==: u)
+      notrace "[project (right)]" $ return ([constraint], MetaSubsts [metaSubst m (length args) (Var (B i))])
   _ -> empty
 
 -- | Mutate rule: \(\forall \overline{x_k}. F(\overline{t_p}, \overline{x.s_q}) \stackrel{?}{=} u \longrightarrow \langle C_1 \cup C_2 \cup C_3, \mathsf{id} \rangle \) where
@@ -454,16 +390,16 @@ mutate rules boundVars = \case
     notrace ("[mutate (left)] " <> show con) $
       return (constraints <> [Ground (rhs :==: u)], MetaSubsts [])
   -- mutate (right)
---   u :==: Con con args -> do
---     Con con' args' :-> rhs <- choose rules >>= freshRule boundVars
---     guard (con == con')
---     guard (length args == length args')
---     constraints <- flip traverse (zip args args') $ \case
---       (Regular t, Regular l) -> pure (Ground (t :==: l))
---       (Scoped s, Scoped l')  -> pure (Forall (Ground (s :==: l')))
---       _                      -> empty
---     notrace ("[mutate (right)] " <> show con) $
---       return (constraints <> [Ground (rhs :==: u)], MetaSubsts [])
+  u :==: Con con args -> do
+    Con con' args' :-> rhs <- choose rules >>= freshRule boundVars
+    guard (con == con')
+    guard (length args == length args')
+    constraints <- flip traverse (zip args args') $ \case
+      (Regular t, Regular l) -> pure (Ground (t :==: l))
+      (Scoped s, Scoped l')  -> pure (Forall (Ground (s :==: l')))
+      _                      -> empty
+    notrace ("[mutate (right)] " <> show con) $
+      return (constraints <> [Ground (rhs :==: u)], MetaSubsts [])
   _ -> empty
 
 -- | Mutate (meta) rule: \(\forall \overline{x_k}. m[\overline{t_k}] \stackrel{?}{=} u \longrightarrow \langle C_1 \cup C_2 \cup C_3, \mathsf{\sigma} \rangle \) where
@@ -489,7 +425,7 @@ mutateMeta rules boundVars = \case
           traverse (argTermToMetaVar args) args'
         notrace ("[mutate meta (left)] " <> ppRules [unsafeCoerce rule]) $
           return (constraints <> [Ground (rhs :==: u)],
-            MetaSubsts [metaSubst m (length args) (Con con args'')])
+            MetaSubsts [metaSubst m (length args) (Con (coerce (++ "'") con) args'')])
   -- mutate meta (right)
 --   u :==: MetaVar m args
 --     | m `notElem` metavars u -> do
@@ -588,178 +524,6 @@ freshRule boundVars (lhs :-> rhs) = flip evalStateT [] $ do
           return m'
         Just m' -> return m'
       pure (MetaVar m' (args <> bvars))
-
--- * Example TRS
-
--- ** Lambda calculus with pairs
-
--- | Rewrite rules for lambda calculus with pairs.
-rulesLambda :: [Rule Variable Void]
-rulesLambda =
-  [ app (lam (MetaVar "m1" [Var Z])) (MetaVar "m2" [])
-      :-> MetaVar "m1" [MetaVar "m2" []]
-  , first (pair (MetaVar "m1" []) (MetaVar "m2" []))
-      :-> MetaVar "m1" []
-  , second (pair (MetaVar "m1" []) (MetaVar "m2" []))
-      :-> MetaVar "m2" []
-  ]
-
--- | A helper to create application terms \(t_1\;t_2\)
-app :: Term Variable a -> Term Variable a -> Term Variable a
-app f x = Con "APP" [Regular f, Regular x]
-
--- | A helper to create lambda abstraction terms \(\lambda x. t\)
-lam :: Term Variable (Inc a) -> Term Variable a
-lam body = Con "LAM" [Scoped body]
-
--- | A helper to create first project terms \(\pi_1\;t\)
-first :: Term Variable a -> Term Variable a
-first p = Con "FIRST" [Regular p]
-
--- | A helper to create second project terms \(\pi_2\;t\)
-second :: Term Variable a -> Term Variable a
-second p = Con "SECOND" [Regular p]
-
--- | A helper to create pair terms \(\langle t_1, t_2 \rangle\)
-pair :: Term Variable a -> Term Variable a -> Term Variable a
-pair f s = Con "PAIR" [Regular f, Regular s]
-
--- * Example terms and constraints
-
--- |
--- >>> putStrLn $ ppTerm' ex1
--- APP(LAM(x₁.m1[x₁]), m2[])
-ex1 :: Term Variable a
-ex1 = Con "APP" [ Regular (Con "LAM" [ Scoped (MetaVar "m1" [Var Z]) ]), Regular (MetaVar "m2" []) ]
-
--- |
--- >>> putStrLn $ ppTerm' ex2
--- m1[m2[]]
-ex2 :: Term Variable a
-ex2 = MetaVar "m1" [MetaVar "m2" []]
-
--- |
--- >>> putStrLn $ ppTerm' ex3
--- APP(m[], x)
-ex3 :: Term'
-ex3 = Con "APP" [ Regular (MetaVar "m" []), Regular (Var "x") ]
-
--- |
--- >>> putStrLn $ ppConstraint' ex4
--- APP(m[y], x) =?= y
-ex4 :: Constraint Variable Variable
-ex4 = Ground (app (MetaVar "m" [Var "y"]) (Var "x") :==: Var "y")
-
--- |
--- >>> putStrLn $ ppConstraint' ex5
--- forall x₁.forall x₂.m1[x₂, x₁] =?= APP(x₁, x₂)
---
--- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 5 rulesLambda [ ex5 ]
--- m1[x₁, x₂] -> APP(x₂, x₁)
-ex5 :: Constraint Variable Variable
-ex5 = Forall $ Forall $
-  Ground (MetaVar "m1" [Var Z, Var (S Z)]
-    :==: Con "APP" [Regular (Var (S Z)), Regular (Var Z)] )
-
--- |
--- >>> putStrLn $ ppConstraint' ex6
--- APP(m[], PAIR(LAM(x₁.APP(x₁, y)), g)) =?= APP(g, y)
---
--- FIXME: unification does not finish in reasonable time!
-ex6 :: Constraint Variable Variable
-ex6 = Ground (app (MetaVar "m" []) (Con "PAIR" [Regular (lam (app (Var Z) (Var (S "y")))), Regular (Var "g")]) :==: app (Var "g") (Var "y"))
-
--- |
--- >>> putStrLn $ ppConstraint' ex7
--- m[y, g] =?= APP(g, y)
--- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 5 rulesLambda [ ex7 ]
--- m[x₁, x₂] -> APP(x₂, x₁)
-ex7 :: Constraint Variable Variable
-ex7 = Ground (MetaVar "m" [Var "y", Var "g"] :==: app (Var "g") (Var "y"))
-
--- |
--- >>> putStrLn $ ppConstraint' ex8
--- APP(m[y], g) =?= APP(g, y)
---
--- FIXME: takes too long
--- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 4 rulesLambda [ ex8 ]
--- m[x₁] -> LAM(x₂.APP(x₂, x₁))
-ex8 :: Constraint Variable Variable
-ex8 = Ground (app (MetaVar "m" [Var "y"]) (Var "g") :==: app (Var "g") (Var "y"))
-
--- |
--- >>> putStrLn $ ppConstraint' ex9
--- m[PAIR(y, g)] =?= g
---
--- FIXME: takes a bit too long and contains unresolved metavariable!
--- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 4 rulesLambda [ ex9 ]
--- m[x₁] -> APP(LAM(x₂.SECOND(x₁)), m₉[x₁])
---
--- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 5 rulesLambda [ ex9 ]
--- m[x₁] -> SECOND(x₁)
-ex9 :: Constraint Variable Variable
-ex9 = Ground (MetaVar "m" [pair (Var "y") (Var "g")] :==: Var "g")
-
--- * Fresh name supply monad
-
--- | A monad transformer with fresh name supply.
-newtype FreshT v m a = FreshT { runFreshT :: StateT [v] m a }
-  deriving (Functor, Applicative, Monad, MonadTrans, MonadFail)
-
--- | Evaluate a computation with given supply of fresh names.
-evalFreshT :: Monad m => FreshT v m a -> [v] -> m a
-evalFreshT (FreshT m) vars = evalStateT m vars
-
--- | Simple fresh name supply context.
-type Fresh v = FreshT v Identity
-
--- | Evaluate a computation with given supply of fresh names.
-evalFresh :: Fresh v a -> [v] -> a
-evalFresh m = runIdentity . evalFreshT m
-
--- | A monad that is capable of generating fresh names of type 'v'.
-class Monad m => MonadFresh v m | m -> v where
-  -- | Generate a fresh name.
-  fresh :: m v
-
-instance (Monoid w, MonadFresh v m) => MonadFresh v (WriterT w m) where
-  fresh = lift fresh
-
-instance Monad m => MonadFresh v (FreshT v m) where
-  fresh = FreshT $ do
-    get >>= \case
-      [] -> error "not enough fresh variables"
-      v:vs -> do
-        put vs
-        notrace ("issuing fresh meta " <> unsafeCoerce v) $ return v
-
-instance MonadPlus m => Alternative (FreshT v m) where
-  empty = FreshT $ lift empty
-  FreshT slx <|> FreshT sly = FreshT $ do
-    vars <- get
-    (result, vars') <- lift $ runStateT slx vars <|> runStateT sly vars
-    put vars'
-    return result
-
-instance MonadPlus m => MonadPlus (FreshT v m) where
-  mzero = empty
-  mplus = (<|>)
-
--- FIXME: invalid instance! it is probably impossible to make it correct
--- instance (MonadPlus m, MonadLogic m) => MonadLogic (FreshT v m) where
---   msplit (FreshT m) = FreshT $ do
---     vars <- get
---     lift (msplit (runStateT m vars)) >>= \case
---       Nothing      -> return Nothing
---       Just ((x, vars'), xs) -> do
---         put vars'
---         return $ Just $ (,) x $ FreshT $ do
---           (y, vars'') <- lift xs
---           put vars''
---           return y
-
-instance MonadFresh v m => MonadFresh v (LogicT m) where
-  fresh = lift fresh
 
 -- * Helpers
 

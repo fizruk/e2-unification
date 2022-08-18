@@ -31,6 +31,9 @@ custom-setup
 
 library
   exposed-modules:
+      Control.Monad.Fresh
+      E2.Example.Lambda
+      E2.Rule
       E2.Term
       E2.Term.Unification
   other-modules:

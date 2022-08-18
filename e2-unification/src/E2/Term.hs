@@ -4,14 +4,17 @@
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE RecordWildCards            #-}
 module E2.Term where
 
 import           Unsafe.Coerce
 
 import           Control.Applicative
+import           Control.Arrow       ((&&&))
 import           Control.Monad       (ap)
 import           Data.Char           (chr, ord)
 import           Data.List           (intercalate)
+import           Data.Semigroup
 import           Data.String         (IsString (..))
 
 -- $setup
@@ -134,6 +137,48 @@ substituteMetaArg' f = \case
   Regular t -> Regular (substituteMeta' f t)
   Scoped s  -> Scoped (substituteMeta' (fmap (fmap (fmap S)) . f) s)
 
+-- ** Meta substitution as a structure
+
+-- | A meta variable substitution.
+data MetaSubst m var = MetaSubst
+  { metaSubstVar   :: m                     -- ^ Meta variable to be substituted.
+  , metaSubstArity :: Int                   -- ^ Meta variable arity (for checks).
+  , metaSubstBody  :: Term m (IncMany var)  -- ^ Meta variable body (a scoped term).
+  } deriving (Show, Functor, Foldable, Traversable)
+
+-- | Construct a meta variable substitution and
+-- check that its declared arity is not exceeded in the body.
+metaSubst :: m -> Int -> Term m (IncMany var) -> MetaSubst m var
+metaSubst m arity body
+  | actualArity >= Just (Max arity) = error "actual arity of the body exceeds declared arity of a meta variable"
+  | otherwise = MetaSubst m arity body
+  where
+    actualArity = foldMap bound body
+    bound (B i) = Just (Max i)
+    bound (F _) = Nothing
+
+-- | A collection of simultaneous meta variable substitutions.
+newtype MetaSubsts m var = MetaSubsts
+  { getMetaSubsts :: [MetaSubst m var] }
+  deriving newtype (Show)
+  deriving stock (Functor, Foldable, Traversable)
+
+-- | Convert meta substitutions into a lookup list.
+toLookupList :: MetaSubsts m var -> [(m, Term m (IncMany var))]
+toLookupList = map (metaSubstVar &&& metaSubstBody) . getMetaSubsts
+
+-- | Composition of substitutions.
+instance Eq m => Semigroup (MetaSubsts m var) where
+  MetaSubsts xs <> MetaSubsts ys = MetaSubsts (xs <> map update ys)
+    where
+      update ms@MetaSubst{..} = ms
+        { metaSubstBody = substituteMeta' (`lookup` substs) metaSubstBody }
+
+      substs = fmap (fmap (fmap F)) <$> toLookupList (MetaSubsts xs)
+
+instance Eq m => Monoid (MetaSubsts m var) where
+  mempty = MetaSubsts []
+
 -- ** Renaming meta variables
 
 -- | Rename meta variables in a term.
@@ -239,6 +284,25 @@ ppInc _ (S x) = x
 ppIncMany :: [String] -> IncMany String -> String
 ppIncMany xs (B i) = (xs !!? "ppIncMany") i
 ppIncMany _ (F x)  = x
+
+-- | Pretty-print meta substitutions (using 'Variable' type for variables and meta variables).
+ppMetaSubsts' :: MetaSubsts Variable Variable -> String
+ppMetaSubsts' = ppMetaSubsts defaultFreshVars getVariable
+
+-- | Pretty-print meta substitutions.
+ppMetaSubsts :: [String] -> (a -> String) -> MetaSubsts Variable a -> String
+ppMetaSubsts freshVars ppVar (MetaSubsts substs) =
+  intercalate "\n" (map (ppMetaSubst freshVars ppVar) substs)
+
+-- | Pretty-print a single meta substitution.
+ppMetaSubst :: [String] -> (a -> String) -> MetaSubst Variable a -> String
+ppMetaSubst freshVars ppVar (MetaSubst (Variable m) arity t)
+  = case splitAt arity freshVars of
+      (xs, ys)
+        | length xs < arity -> error "not enough fresh variables"
+        | otherwise ->
+            let params = intercalate ", " xs
+            in m <> "[" <> params <> "]" <> " -> " <> ppTerm ys (ppIncMany xs . fmap ppVar) t
 
 -- * Helpers
 
