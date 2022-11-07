@@ -17,7 +17,7 @@ import           Control.Monad.Logic
 import           Control.Monad.State
 import           Control.Monad.Writer
 import qualified Data.Bifunctor
-import           Data.List            (elemIndex, inits, nub, tails)
+import           Data.List            (elemIndex, inits, isSuffixOf, nub, tails)
 import           Data.Void
 
 import           Control.Monad.Fresh
@@ -107,6 +107,133 @@ defaultUnifyAll = flip evalFresh defaultVars . observeAllT . runUnify
 
 -- * \(E^2\)-unification procedure
 
+data Simplifications a = Simplifications
+  { simplifyDelete     :: a
+  , simplifyRigidRigid :: a
+  , simplifyFlex       :: a
+  , simplifyMutateMeta :: a
+  } deriving (Functor, Foldable, Traversable)
+
+instance Applicative Simplifications where
+  pure x = Simplifications x x x x
+  Simplifications f g h k <*> Simplifications x y z w =
+    Simplifications (f x) (g y) (h z) (k w)
+
+tryE2'
+  :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f, MonadLogic f)
+  => [Rule m Void]    -- ^ Set \(R\) of rewrite rules.
+  -> [Constraint m a] -- ^ Collection of constraints to simplify.
+  -> f (String, [Constraint m a], MetaSubsts m a)
+tryE2' _ [] = pure mempty
+tryE2' rules constraints = do
+  Simplifications{..} <- sequenceA <$>
+    traverse (uncurry $ try rules) (splits constraints)
+  once (asum simplifyDelete) `orElse`
+    (firstNonEmpty simplifyRigidRigid
+      <|> firstNonEmpty simplifyFlex
+      <|> firstNonEmpty simplifyMutateMeta)
+
+firstNonEmpty :: MonadLogic f => [f a] -> f a
+firstNonEmpty [] = empty
+firstNonEmpty (m:ms) = do
+  msplit m >>= \case
+    Nothing      -> firstNonEmpty ms
+    Just (x, xs) -> pure x <|> xs
+
+asum :: (Alternative f, Foldable t) => t (f a) -> f a
+asum = foldr (<|>) empty
+
+data IsFound = NotFound | Found
+
+-- | Ensure that at least one element in a 'Traversable' container
+-- is not 'empty'. Returns new container with the same contents,
+-- but computed results (until the first non-empty element).
+--
+-- >>> ensureExists' [empty <|> empty, pure 3, empty <|> pure 1] :: [[[Int]]]
+-- [[[],[3],[1]]]
+--
+-- >>> ensureExists' [empty <|> empty, empty, empty] :: [[[Int]]]
+-- []
+ensureExists'
+  :: (MonadPlus f, MonadLogic f, Traversable t)
+  => t (f a)
+  -> f (t (f a))
+ensureExists' t = flip evalStateT NotFound $ do
+  t' <- traverse k t
+  get >>= \case
+    NotFound -> lift empty
+    Found    -> return t'
+  where
+    k :: (MonadPlus f, MonadLogic f) => f a -> StateT IsFound f (f a)
+    k x = get >>= \case
+      NotFound -> (do
+        x' <- lift $ ensureExists x
+        put Found
+        return x') `orElse` return empty
+      Found -> return x
+
+ensureSimplificationExists
+  :: (MonadPlus f, MonadLogic f)
+  => Simplifications (f a)
+  -> f (Simplifications (f a))
+ensureSimplificationExists = ensureExists'
+
+ensureExists :: MonadLogic f => f a -> f (f a)
+ensureExists m =
+  msplit m >>= \case
+    Nothing      -> empty
+    Just (x, xs) -> return (pure x <|> xs)
+
+try
+  :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f, MonadLogic f)
+  => [Rule m Void]    -- ^ Set \(R\) of rewrite rules.
+  -> Constraint m a   -- ^ A constraint to simplify.
+  -> [Constraint m a] -- ^ Other constraints (to preserve).
+  -> f (Simplifications (f (String, [Constraint m a], MetaSubsts m a)))
+try rules c cs' = ensureSimplificationExists $
+  Simplifications
+    { simplifyDelete      = tryDeleteEliminate
+    , simplifyRigidRigid  = tryRigidRigid
+    , simplifyFlex        = tryFlex
+    , simplifyMutateMeta  = tryMutateMeta
+    }
+  where
+    tryDeleteEliminate = do
+      (ruleName, cs'', substs) <- upgrade (\c' _bvars -> delete c' <|> eliminate c') c -- <|> eliminate c') c
+      return (ruleName, cs'' <> map (applySubsts substs) cs', substs)
+
+    tryRigidRigid = do
+      guard (isRigidRigid c)
+      (ruleName, cs'', substs) <- upgrade (\c' bvars -> decompose c' <|> mutate rules bvars c') c
+      return (ruleName, cs'' <> map (applySubsts substs) cs', substs)
+
+    tryFlex = do
+      (ruleName, cs'', substs) <- upgrade (\c' _bvars -> project c' <|> imitate c') c
+      return (ruleName, cs'' <> map (applySubsts substs) cs', substs)
+
+    tryMutateMeta = do
+      (ruleName, cs'', substs) <- upgrade (\c' bvars -> mutateMeta rules bvars c') c
+      return (ruleName, cs'' <> map (applySubsts substs) cs', substs)
+
+    upgrade = convert . go []
+
+    convert k c' = do
+      (ruleName, cs, substs) <- k (fmap F c')
+      cs'' <- traverse (traverse removeIncMany) cs
+      substs' <- traverse removeIncMany substs
+      return (ruleName, cs'', substs')
+
+--     go :: [Term m (IncMany a)]
+--        -> (GroundConstraint m (IncMany a) -> [Term m (IncMany a)] -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a)))
+--        -> Constraint m (IncMany a)
+--        -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+    go bvars k (Ground c') = k c' bvars
+    go bvars k (Forall c') = do
+      (ruleName, cs, substs) <- go (Var (joinInc Z) : map (fmap (joinInc . S)) bvars) k (joinInc <$> c')
+      cs'' <- traverse (traverse decIncMany) cs
+      substs' <- traverse decIncMany substs
+      return (ruleName, cs'', substs')
+
 -- | Attempt applying one step of \(E^2\)-unification to a collection of constraints.
 --
 -- This will try to simplify constraints in the following way:
@@ -115,54 +242,54 @@ defaultUnifyAll = flip evalFresh defaultVars . observeAllT . runUnify
 -- 1. Apply 'delete' or 'eliminate' rule to some constraint if possible.
 -- 2. Simplify any rigid-rigid constraint with 'decompose' or 'mutate' rules.
 -- 3. Otherwise, apply 'project', 'imitate', or 'mutateMeta' rules.
-tryE2
-  :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f, MonadLogic f)
-  => [Rule m Void]    -- ^ Set \(R\) of rewrite rules.
-  -> [Constraint m a] -- ^ Collection of constraints to simplify.
-  -> f ([Constraint m a], MetaSubsts m a)
-tryE2 _ [] = pure mempty
-tryE2 rules constraints =
-  -- apply delete and eliminate rules first (deterministic)
-  once (tryDeleteEliminate constraints) `orElse`
-    -- then solve rigid-rigid constraints (non-deterministic)
-    tryRigidRigid constraints <|> -- `orElse`
-      -- finally, solve flex-rigid and flex-flex constraints
-      tryFlex constraints
-  where
-    tryDeleteEliminate cs = do
-      (c, cs') <- selectOne cs
-      (cs'', substs) <- upgrade (\c' _bvars -> delete c') c -- <|> eliminate c') c
-      return (cs'' <> map (applySubsts substs) cs', substs)
-
-    tryRigidRigid cs = do
-      (c, cs') <- selectOne cs
-      guard (isRigidRigid c)
-      (cs'', substs) <- upgrade (\c' bvars -> decompose c' <|> mutate rules bvars c') c
-      return (cs'' <> map (applySubsts substs) cs', substs)
-
-    tryFlex cs = do
-      (c, cs') <- selectOne cs
-      (cs'', substs) <- upgrade (\c' bvars -> project c' <|> imitate c' <|> mutateMeta rules bvars c') c
-      return (cs'' <> map (applySubsts substs) cs', substs)
-
-    upgrade = convert . go []
-
-    convert k c = do
-      (cs, substs) <- k (fmap F c)
-      cs' <- traverse (traverse removeIncMany) cs
-      substs' <- traverse removeIncMany substs
-      return (cs', substs')
-
---     go :: [Term m (IncMany a)]
---        -> (GroundConstraint m (IncMany a) -> [Term m (IncMany a)] -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a)))
---        -> Constraint m (IncMany a)
---        -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
-    go bvars k (Ground c) = k c bvars
-    go bvars k (Forall c) = do
-      (cs, substs) <- go (Var (joinInc Z) : map (fmap (joinInc . S)) bvars) k (joinInc <$> c)
-      cs' <- traverse (traverse decIncMany) cs
-      substs' <- traverse decIncMany substs
-      return (cs', substs')
+-- tryE2
+--   :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f, MonadLogic f)
+--   => [Rule m Void]    -- ^ Set \(R\) of rewrite rules.
+--   -> [Constraint m a] -- ^ Collection of constraints to simplify.
+--   -> f (String, [Constraint m a], MetaSubsts m a)
+-- tryE2 _ [] = pure mempty
+-- tryE2 rules constraints =
+--   -- apply delete and eliminate rules first (deterministic)
+--   once (tryDeleteEliminate constraints) `orElse`
+--     -- then solve rigid-rigid constraints (non-deterministic)
+--     tryRigidRigid constraints <|> -- `orElse`
+--       -- finally, solve flex-rigid and flex-flex constraints
+--       tryFlex constraints
+--   where
+--     tryDeleteEliminate cs = do
+--       (c, cs') <- selectOne cs
+--       (ruleName, cs'', substs) <- upgrade (\c' _bvars -> delete c') c -- <|> eliminate c') c
+--       return (ruleName, cs'' <> map (applySubsts substs) cs', substs)
+--
+--     tryRigidRigid cs = do
+--       (c, cs') <- selectOne cs
+--       guard (isRigidRigid c)
+--       (cs'', substs) <- upgrade (\c' bvars -> decompose c' <|> mutate rules bvars c') c
+--       return (cs'' <> map (applySubsts substs) cs', substs)
+--
+--     tryFlex cs = do
+--       (c, cs') <- selectOne cs
+--       (cs'', substs) <- upgrade (\c' bvars -> project c' <|> imitate c' <|> mutateMeta rules bvars c') c
+--       return (cs'' <> map (applySubsts substs) cs', substs)
+--
+--     upgrade = convert . go []
+--
+--     convert k c = do
+--       (cs, substs) <- k (fmap F c)
+--       cs' <- traverse (traverse removeIncMany) cs
+--       substs' <- traverse removeIncMany substs
+--       return (cs', substs')
+--
+-- --     go :: [Term m (IncMany a)]
+-- --        -> (GroundConstraint m (IncMany a) -> [Term m (IncMany a)] -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a)))
+-- --        -> Constraint m (IncMany a)
+-- --        -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+--     go bvars k (Ground c) = k c bvars
+--     go bvars k (Forall c) = do
+--       (cs, substs) <- go (Var (joinInc Z) : map (fmap (joinInc . S)) bvars) k (joinInc <$> c)
+--       cs' <- traverse (traverse decIncMany) cs
+--       substs' <- traverse decIncMany substs
+--       return (cs', substs')
 
 
 -- | Perform unificiation procedure, using DFS
@@ -177,13 +304,17 @@ unifyDFS
   -> f ([Constraint m a], MetaSubsts m a)
 unifyDFS maxDepth rules = go 0
   where
-    go depth [] = notrace ("solution found at depth = " <> show (depth - 1)) $
+    go _depth [] = -- trace (replicate (depth * 1) ' ' <> "solution found") $
       return mempty
     go depth constraints
-      | depth > maxDepth = pure (constraints, mempty)
-      | otherwise = notrace (replicate (depth * 2) ' ' <> "[" <> show depth <> "] " <> ppConstraints' (unsafeCoerce constraints)) $ do
-          (cs, substs) <- tryE2 rules constraints
-          (cs', substs') <- go (depth + 1) cs
+      | depth >= maxDepth = -- trace (replicate (depth * 1) ' ' <> "max depth reached!") $
+          pure (constraints, mempty)
+      | otherwise = notrace (replicate (depth * 1) ' ' <> "[" <> show depth <> "] " <> ppConstraints' (unsafeCoerce constraints)) $ do
+          (ruleName, cs, substs) <- tryE2' rules constraints
+          (cs', substs') <-
+            if (depth + 1 >= maxDepth && not (null cs))
+               then trace (replicate (depth * 1) ' ' <> "[stop] " <> ruleName) $ go (depth + 1) cs
+               else trace (replicate (depth * 1) ' ' <> ruleName) $ go (depth + 1) cs
           return (cs', substs' <> substs)
 
 -- | Perform unificiation procedure, using k-depth DFS
@@ -202,10 +333,10 @@ unifyBFSviaDFS maxIterations maxDepth rules = fmap . clean <*> go 0
     go n [] = notrace ("solution found at depth = " <> show n) $
       pure mempty
     go n constraints
-      | n > maxIterations = empty
+      | n >= maxIterations = empty
       | otherwise = do
           tryClose (unifyDFS maxDepth rules constraints) >>= \case
-            Left incompletes -> notrace (replicate (2 * n) ' ' <> "after iteration " <> show n <> " we have " <> show (length incompletes) <> " incomplete branches") $ do
+            Left incompletes -> notrace (replicate (2 * n) ' ' <> "after iteration " <> show (n + 1) <> " we have " <> show (length incompletes) <> " incomplete branches") $ do
               (cs, substs) <- choose incompletes
               substs' <- go (n + 1) cs
               return (substs' <> substs)
@@ -269,10 +400,10 @@ ppConstraint freshVars ppVar = \case
 delete
   :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f)
   => GroundConstraint m (IncMany a)
-  -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+  -> f (String, [Constraint m (IncMany a)], MetaSubsts m (IncMany a))
 delete = \case
   t :==: t'
-    | t == t' -> notrace "[delete]" $ return ([], mempty)
+    | t == t' -> notrace "[delete]" $ return ("delete", [], mempty)
   _ -> empty
 
 -- | Decompose rule: \(\forall \overline{x_k}. F(\overline{t_n}, \overline{x.s_m}) \stackrel{?}{=} F(\overline{t'_n}, \overline{x.s'_m}) \longrightarrow \langle C_1 \cup C_2, \mathsf{id} \rangle \) where
@@ -282,12 +413,12 @@ delete = \case
 decompose
   :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f)
   => GroundConstraint m (IncMany a)
-  -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+  -> f (String, [Constraint m (IncMany a)], MetaSubsts m (IncMany a))
 decompose = \case
   Con con args :==: Con con' args'
-    | con == con' && length args == length args' -> do
+    | coerce (dropWhile (== '\'') . reverse) con == (coerce (dropWhile (== '\'') . reverse) con' :: String) && length args == length args' -> do
         args'' <- sequence $ zipWith mkConstraintArg args args'
-        notrace ("[decompose] " <> show con) $ return (args'', mempty)
+        notrace ("[decompose] " <> show con) $ return ("decompose " <> show con, args'', mempty)
   _ -> empty
   where
     mkConstraintArg (Regular t) (Regular t') = return $ Ground (t :==: t')
@@ -302,18 +433,18 @@ decompose = \case
 eliminate
   :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f)
   => GroundConstraint m (IncMany a)
-  -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+  -> f (String, [Constraint m (IncMany a)], MetaSubsts m (IncMany a))
 eliminate = \case
   -- eliminate (left)
   MetaVar m args :==: t
     | m `notElem` metavars t,
       Just zs <- distinctBoundVars args
-      -> notrace "[eliminate (left)]" $ return ([], MetaSubsts [metaSubst m (length args) (t >>= zs)])
+      -> notrace "[eliminate (left)]" $ return ("eliminate (left)", [], MetaSubsts [metaSubst m (length args) (t >>= zs)])
   -- eliminate (right)
   t :==: MetaVar m args
     | m `notElem` metavars t,
       Just zs <- distinctBoundVars args
-      -> notrace "[eliminate (right)]" $ return ([], MetaSubsts [metaSubst m (length args) (t >>= zs)])
+      -> notrace "[eliminate (right)]" $ return ("eliminate (right)", [], MetaSubsts [metaSubst m (length args) (t >>= zs)])
   _ -> empty
 
 -- | Imitate rule: \(\forall \overline{x_k}. m[\overline{t_k}] \stackrel{?}{=} F(\overline{u_p}, \overline{x.s_q}) \longrightarrow \langle C_1 \cup C_2, \sigma \rangle \) where
@@ -326,18 +457,20 @@ eliminate = \case
 imitate
   :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f)
   => GroundConstraint m (IncMany a)
-  -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+  -> f (String, [Constraint m (IncMany a)], MetaSubsts m (IncMany a))
 imitate = \case
   -- imitate (left)
   MetaVar m args :==: Con con args'
-    | m `notElem` (foldMap metavarsArg args') -> do
+    | not (coerce ("'" `isSuffixOf`) con),
+      m `notElem` (foldMap metavarsArg args') -> do
       (args'', constraints) <- runWriterT $ traverse (argTermToMetaVar args) args'
-      notrace ("[imitate (left)] " <> show con) $ return (constraints, MetaSubsts [metaSubst m (length args) (Con con args'')])
+      notrace ("[imitate (left)] " <> show con) $ return ("imitate (left) " <> show con, constraints, MetaSubsts [metaSubst m (length args) (Con con args'')])
   -- imitate (right)
   Con con args' :==: MetaVar m args
-    | m `notElem` (foldMap metavarsArg args') -> do
+    | not (coerce ("'" `isSuffixOf`) con),
+      m `notElem` (foldMap metavarsArg args') -> do
       (args'', constraints) <- runWriterT $ traverse (argTermToMetaVar args) args'
-      notrace ("[imitate (right)] " <> show con) $ return (constraints, MetaSubsts [metaSubst m (length args) (Con con args'')])
+      notrace ("[imitate (right)] " <> show con) $ return ("imitate (right) " <> show con, constraints, MetaSubsts [metaSubst m (length args) (Con con args'')])
   _ -> empty
 
 -- | Project rule: \(\forall \overline{x_k}. m[\overline{t_k}] \stackrel{?}{=} u \longrightarrow \langle C, \sigma \rangle \) where
@@ -348,7 +481,7 @@ imitate = \case
 project
   :: (Eq m, Eq a, MonadPlus f, MonadFail f, MonadFresh m f)
   => GroundConstraint m (IncMany a)
-  -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+  -> f (String, [Constraint m (IncMany a)], MetaSubsts m (IncMany a))
 project = \case
   -- project (left)
   MetaVar m args :==: u
@@ -356,13 +489,13 @@ project = \case
       i <- choose [0 .. length args - 1]
       let constraint = Ground (args !! i :==: u)
       notrace ("[project " ++ show (i + 1) ++ "/" ++ show (length args) ++ " (left)]") $
-        return ([constraint], MetaSubsts [metaSubst m (length args) (Var (B i))])
+        return ("project " ++ show (i + 1) ++ "/" ++ show (length args) ++ " (left)", [constraint], MetaSubsts [metaSubst m (length args) (Var (B i))])
   -- project (right)
   MetaVar m args :==: u
     | m `notElem` metavars u -> do
       i <- choose [0 .. length args - 1]
       let constraint = Ground (args !! i :==: u)
-      notrace "[project (right)]" $ return ([constraint], MetaSubsts [metaSubst m (length args) (Var (B i))])
+      notrace "[project (right)]" $ return ("project " ++ show (i + 1) ++ "/" ++ show (length args) ++ " (right)", [constraint], MetaSubsts [metaSubst m (length args) (Var (B i))])
   _ -> empty
 
 -- | Mutate rule: \(\forall \overline{x_k}. F(\overline{t_p}, \overline{x.s_q}) \stackrel{?}{=} u \longrightarrow \langle C_1 \cup C_2 \cup C_3, \mathsf{id} \rangle \) where
@@ -376,7 +509,7 @@ mutate
   => [Rule m Void]
   -> [Term m (IncMany a)] -- bound variables (FIXME: handle better)
   -> GroundConstraint m (IncMany a)
-  -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+  -> f (String, [Constraint m (IncMany a)], MetaSubsts m (IncMany a))
 mutate rules boundVars = \case
   -- mutate (left)
   Con con args :==: u -> do
@@ -388,7 +521,7 @@ mutate rules boundVars = \case
       (Scoped s, Scoped l')  -> pure (Forall (Ground (s :==: l')))
       _                      -> empty
     notrace ("[mutate (left)] " <> show con) $
-      return (constraints <> [Ground (rhs :==: u)], MetaSubsts [])
+      return ("mutate (left) " <> show con, constraints <> [Ground (rhs :==: u)], MetaSubsts [])
   -- mutate (right)
   u :==: Con con args -> do
     Con con' args' :-> rhs <- choose rules >>= freshRule boundVars
@@ -399,7 +532,7 @@ mutate rules boundVars = \case
       (Scoped s, Scoped l')  -> pure (Forall (Ground (s :==: l')))
       _                      -> empty
     notrace ("[mutate (right)] " <> show con) $
-      return (constraints <> [Ground (rhs :==: u)], MetaSubsts [])
+      return ("mutate (right) " <> show con, constraints <> [Ground (rhs :==: u)], MetaSubsts [])
   _ -> empty
 
 -- | Mutate (meta) rule: \(\forall \overline{x_k}. m[\overline{t_k}] \stackrel{?}{=} u \longrightarrow \langle C_1 \cup C_2 \cup C_3, \mathsf{\sigma} \rangle \) where
@@ -415,17 +548,23 @@ mutateMeta
   => [Rule m Void]
   -> [Term m (IncMany a)]
   -> GroundConstraint m (IncMany a)
-  -> f ([Constraint m (IncMany a)], MetaSubsts m (IncMany a))
+  -> f (String, [Constraint m (IncMany a)], MetaSubsts m (IncMany a))
 mutateMeta rules boundVars = \case
   -- mutate meta (left)
   MetaVar m args :==: u
     | m `notElem` metavars u -> do
         rule@(Con con args' :-> rhs) <- choose rules >>= freshRule boundVars
+
+        -- TODO: the heuristic below does not help, how can we cut the search space?
+        -- let ruleConstructors = foldMap constructorsArg args'
+        --    lhsConstructors = foldMap constructors args
+        -- guard (any (`elem` lhsConstructors) ruleConstructors)
+
         (args'', constraints) <- runWriterT $
-          traverse (argTermToMetaVar args) args'
+          traverse (argTermToMetaVar args . protect) args'
         notrace ("[mutate meta (left)] " <> ppRules [unsafeCoerce rule]) $
-          return (constraints <> [Ground (rhs :==: u)],
-            MetaSubsts [metaSubst m (length args) (Con (coerce (++ "'") con) args'')])
+          return ("mutate meta (left) " <> ppRules [unsafeCoerce rule], constraints <> [Ground (rhs :==: u)],
+            MetaSubsts [metaSubst m (length args) (Con con args'')])
   -- mutate meta (right)
 --   u :==: MetaVar m args
 --     | m `notElem` metavars u -> do
@@ -436,6 +575,15 @@ mutateMeta rules boundVars = \case
 --           return (constraints <> [Ground (rhs :==: u)],
 --             MetaSubsts [metaSubst m (length args) (Con con args'')])
   _ -> empty
+  where
+    protect :: ArgTerm m a -> ArgTerm m a
+    protect (Regular t) = Regular (protect' t)
+    protect (Scoped s)  = Scoped (protect' s)
+
+    protect' :: Term m a -> Term m a
+    protect' (Var x)          = Var x
+    protect' (Con con args)   = Con (coerce (++ "'") con) (map protect args)
+    protect' (MetaVar m args) = MetaVar m (map protect' args)
 
 -- ** Helpers
 

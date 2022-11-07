@@ -78,6 +78,15 @@ metavarsArg = \case
   Regular t -> metavars t
   Scoped  s -> metavars s
 
+constructors :: Term m a -> [Label]
+constructors Var{}            = []
+constructors (Con con args)   = con : foldMap constructorsArg args
+constructors (MetaVar _ args) = foldMap constructors args
+
+constructorsArg :: ArgTerm m a -> [Label]
+constructorsArg (Regular t) = constructors t
+constructorsArg (Scoped t)  = constructors t
+
 -- * Substitutions
 
 -- ** Variable substitution

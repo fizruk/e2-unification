@@ -1,5 +1,6 @@
 module E2.Rule where
 
+import           Data.List (intercalate)
 import           Data.Void
 import           E2.Term
 
@@ -20,7 +21,7 @@ rulesLHS = map ruleLHS
 
 -- | Pretty-print a rewrite rule.
 ppRules :: [Rule Variable Void] -> String
-ppRules = unlines . map ppRule
+ppRules = intercalate "\n" . map ppRule
   where
     ppRule (t :-> t') = ppTerm defaultFreshVars absurd t <> " ——» " <> ppTerm defaultFreshVars absurd t'
 

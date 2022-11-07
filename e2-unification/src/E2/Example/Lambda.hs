@@ -62,6 +62,9 @@ ex3 = Con "APP" [ Regular (MetaVar "m" []), Regular (Var "x") ]
 -- |
 -- >>> putStrLn $ ppConstraint' ex4
 -- APP(m[y], x) =?= y
+--
+-- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 10 rulesLambda [ ex4 ]
+-- m[x₁] -> LAM(x₂.x₁)
 ex4 :: Constraint Variable Variable
 ex4 = Ground (app (MetaVar "m" [Var "y"]) (Var "x") :==: Var "y")
 
@@ -96,8 +99,7 @@ ex7 = Ground (MetaVar "m" [Var "y", Var "g"] :==: app (Var "g") (Var "y"))
 -- >>> putStrLn $ ppConstraint' ex8
 -- APP(m[y], g) =?= APP(g, y)
 --
--- FIXME: takes too long
--- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 4 rulesLambda [ ex8 ]
+-- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 9 rulesLambda [ ex8 ]
 -- m[x₁] -> LAM(x₂.APP(x₂, x₁))
 ex8 :: Constraint Variable Variable
 ex8 = Ground (app (MetaVar "m" [Var "y"]) (Var "g") :==: app (Var "g") (Var "y"))
@@ -106,11 +108,7 @@ ex8 = Ground (app (MetaVar "m" [Var "y"]) (Var "g") :==: app (Var "g") (Var "y")
 -- >>> putStrLn $ ppConstraint' ex9
 -- m[PAIR(y, g)] =?= g
 --
--- FIXME: takes a bit too long and contains unresolved metavariable!
--- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 4 rulesLambda [ ex9 ]
--- m[x₁] -> APP(LAM(x₂.SECOND(x₁)), m₉[x₁])
---
--- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 5 rulesLambda [ ex9 ]
+-- >>> putStrLn $ ppMetaSubsts' $ defaultUnify $ unifyBFSviaDFS 1 6 rulesLambda [ ex9 ]
 -- m[x₁] -> SECOND(x₁)
 ex9 :: Constraint Variable Variable
 ex9 = Ground (MetaVar "m" [pair (Var "y") (Var "g")] :==: Var "g")
